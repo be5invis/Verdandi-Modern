@@ -1,0 +1,16 @@
+Open($1);
+SelectAll();
+ClearHints();
+ClearInstrs();
+UnlinkReference();
+SetFontOrder(2);
+SetOS2Value('WinAscent', 1080)
+SetOS2Value('WinDescent', 420)
+SetOS2Value('TypoAscent', 1080)
+SetOS2Value('TypoDescent', -420)
+SetOS2Value('TypoLinegap', 0)
+SetOS2Value('HHeadAscent', 1080)
+SetOS2Value('HHeadDescent', -420)
+SetOS2Value('HHeadLinegap', 0)
+Generate($1:r + ".ttf");
+Close();

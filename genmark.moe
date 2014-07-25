@@ -1,0 +1,239 @@
+def fs = require 'fs'
+def path = require 'path'
+def sfdContent = fs.readFileSync(process.argv[2], 'utf-8').split `\r?\n`
+def sylvester = require 'sylvester'
+
+def setHash(sets) {
+	def hash = [:]
+	def arr = []
+	for(set <- arguments) {
+		for(p <- keysof set) {
+			if(not hash[p] >= 0) {
+				hash[p] = arr.length
+				arr.push p
+			}
+		}
+	}
+	return [hash: hash, arr: arr]
+}
+
+def chars = [:]
+def cArr = []
+var curChar = null
+var italicAngle = 0
+
+for(line <- sfdContent) {
+	-- extract italic angle
+	if(`^ItalicAngle: `.test line) {
+		italicAngle = 0 - line.split(' ')[1]
+	}
+
+	if(`^StartChar: `.test line) {
+		curChar = line.slice 11
+		cArr.push(curChar)
+		chars[curChar] = [index: cArr.length - 1, mixed: false, parts: [], hints: [:]]
+	}
+	if(`^Width: `.test line and curChar) {
+		var [(), width] = line.split ' '
+		chars[curChar].width = width - 0
+	}
+	if(line === 'SplineSet') {
+		chars[curChar].mixed = true
+	}
+	if(`^Encoding: `.test line and curChar) {
+		chars[curChar].unicode = line.split(' ')[2]
+	}
+	if(`^Refer: `.test line) {
+		var refArray = line.trim().split ' '
+		if(refArray[4] == '1' and refArray[5] == '0' and refArray[6] == '0' and refArray[7] == '1') {
+			chars[curChar].parts.push [
+				index: refArray[1] - 0
+				unicode: refArray[2] - 0
+				x: refArray[8] - 0
+				y: refArray[9] - 0
+				others: refArray.slice(10)
+			]
+		}
+	}
+	if(`^AnchorPoint: `.test line) {
+		var [(), anchorID, anchorX, anchorY] = line.split(' ')
+		anchorID = anchorID.slice(1, (-1))
+		chars[curChar].hints[anchorID] = [x: anchorX, y: anchorY]
+	}
+}
+
+def italicSkew = math.tan italicAngle
+
+def solveGroup(baseChars, markChars, compositions, prop, hints) {
+	-- Solve for X
+	def [arr: slotArr, hash: slotHash] = setHash(baseChars, markChars)
+	var m = []
+	var cs = []
+	for(c <- compositions) {
+		var equation = slotArr.map {0}
+		equation[slotHash[cArr[c.base.index]]] = 1
+		equation[slotHash[cArr[c.mark.index]]] = (-1)
+		m.push equation
+		cs.push (c.mark[prop] - c.base[prop])
+	}
+	if(hints) for(hint <- hints) {
+		var [id: hintid, pos: hintpos] = hint
+		var equation = slotArr.map {0}
+		equation[slotHash[hintid]] = 1
+		m.push equation
+		cs.push hintpos
+	}
+
+	def coffs = sylvester.Matrix.create m
+	def ys = sylvester.Vector.create cs
+	def result = (coffs.transpose().x(coffs).inverse().x(coffs.transpose())).x(ys)
+
+	var ans = [:]
+	
+	for(i <- 0..result.elements.length) {
+		ans[slotArr[i]] = [id: slotArr[i], base: baseChars[slotArr[i]], pos: math.round(result.elements[i])]
+	}
+
+	return ans
+}
+def solveLinearRegression(x, y) {
+	var n = x.length
+	var sx = 0
+	var sy = 0
+	var sxx = 0
+	var syy = 0
+	var sxy = 0
+
+	for(i <- 0..n) {
+		sx += x[i]
+		sy += y[i]
+		sxx += x[i] * x[i]
+		sxy += x[i] * y[i]
+		syy += y[i] * y[i]
+	}
+	def slope = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+	def intercept = (sy - slope * sx) / n
+
+	return [slope, intercept]
+}
+
+def markDataHash = [:]
+def solveAnchorGroup(anchorType, LOW, HIGH, interpolationGroups) {
+	var baseChars = [:]
+	var markChars = [:]
+	var compositions = []
+	var xhints = []
+	var yhints = []
+
+	for([char, id] <- pairsof chars) {
+		if(not char.mixed and char.parts.length == 2) {
+			-- Calculate composition
+			var cpMap = [:]
+			var markId = null
+			var baseId = null
+			for(p <- char.parts) {
+				cpMap[cArr[p.index]] = p
+				if(p.unicode >= LOW and p.unicode <= HIGH) {
+					markId = cArr[p.index]
+				} else {
+					baseId = cArr[p.index]
+				}
+			}
+
+			if(markId and baseId) {
+				compositions.push [id: id, base: cpMap[baseId], mark: cpMap[markId]]
+				baseChars[baseId] = true
+				markChars[markId] = true
+			}
+		}
+	}
+
+	-- Extract hints
+	for(id <- (keysof baseChars).concat(keysof markChars)) {
+		if(chars[id].hints[anchorType]) {
+			xhints.push [id: id, pos: chars[id].hints[anchorType].x]
+			yhints.push [id: id, pos: chars[id].hints[anchorType].y]
+		}
+	}
+
+	def xdata = solveGroup(baseChars, markChars, compositions, 'x', xhints)
+	def ydata = solveGroup(baseChars, markChars, compositions, 'y', yhints)
+
+
+	if(interpolationGroups) {
+		for(ig <- interpolationGroups) {
+			-- y: use average
+			var ysum = 0
+			var fn = 0
+			for(id <- ig) if(baseChars[id]) {
+				ysum += ydata[id].pos
+				fn += 1
+			}
+
+			for(id <- ig) if(not baseChars[id]) {
+				ydata[id] = [id: id, base: true, pos: ysum / fn]
+			}
+
+			-- x: interpolate from width info
+			-- use linear fit
+			var x_widths = []
+			var x_poses = []
+			for(id <- ig) if(baseChars[id]) {
+				x_widths.push chars[id].width
+				x_poses.push xdata[id].pos
+			}
+			def [x_slope, x_intercept] = solveLinearRegression(x_widths, x_poses)
+			for(id <- ig) if(not baseChars[id]) {
+				xdata[id] = [id: id, base: true, pos: (x_slope * chars[id].width + x_intercept)]
+			}
+		}
+	}
+
+	for(char <- keysof xdata) {
+		if(not markDataHash[char]) markDataHash[char] = []
+		markDataHash[char].push ("\n" + [
+			"AnchorPoint:"
+			'"' + anchorType + '"'
+			xdata[char].pos
+			ydata[char].pos
+			('basechar' when(xdata[char].base) or 'mark')
+			markDataHash[char].length
+		].join ' ')
+	}
+}
+
+solveAnchorGroup(
+	"Top"
+	0x300
+	0x315
+	[
+		'A.B.C.D.E.F.G.H.I.J.K.L.M.N.O.P.Q.R.S.T.U.V.W.X.Y.Z.Alpha.Beta.Gamma.uni0394.Epsilon.Zeta.Eta.Theta.Iota.Kappa.Lambda.Mu.Nu.Xi.Omicron.Pi.Rho.Sigma.Tau.Upsilon.Phi.Chi.Psi.uni03A9'.split('.')
+		'a.c.e.g.dotlessi.uni0237.m.n.o.p.q.r.s.u.v.w.x.y.z.alpha.gamma.epsilon.eta.iota.kappa.uni03BC.nu.omicron.pi.rho.sigma1.sigma.tau.upsilon.chi.psi.omega.phi1.omega1'.split('.')
+		'b.d.f.h.k.l.t.beta.delta.zeta.theta.lambda.xi.phi.theta1'.split('.')
+	]
+)
+solveAnchorGroup(
+	"Bottom"
+	0x316
+	0x326
+	[
+		'A.B.C.D.E.F.G.H.I.J.K.L.M.N.O.P.Q.R.S.T.U.V.W.X.Y.Z.Alpha.Beta.Gamma.uni0394.Epsilon.Zeta.Eta.Theta.Iota.Kappa.Lambda.Mu.Nu.Xi.Omicron.Pi.Rho.Sigma.Tau.Upsilon.Phi.Chi.Psi.uni03A9'.split('.')
+		'a.c.e.g.dotlessi.uni0237.m.n.o.p.q.r.s.u.v.w.x.y.z.b.d.f.h.k.l.t.alpha.gamma.epsilon.eta.iota.kappa.uni03BC.nu.omicron.pi.rho.sigma1.sigma.tau.upsilon.chi.psi.omega.beta.delta.zeta.theta.lambda.xi.phi'.split('.')
+	]
+)
+solveAnchorGroup(
+	"Cedilla"
+	0x327
+	0x327
+	[
+		'A.B.C.D.E.F.G.H.I.J.K.L.M.N.O.P.Q.R.S.T.U.V.W.X.Y.Z'.split('.')
+		'a.c.e.g.dotlessi.uni0237.m.n.o.p.q.r.s.u.v.w.x.y.z.b.d.f.h.k.l.t'.split('.')
+	]
+)
+
+var sfdStr = sfdContent.join("\n").replace(`^AnchorPoint: .*\n`gm, '')
+for([replacement, id] <- pairsof markDataHash) {
+	sfdStr = sfdStr.replace(("StartChar: " + id + "\n"), ("StartChar: " + id + "\n" + replacement.join("\n").trim() + "\n"))
+}
+
+fs.writeFileSync((path.dirname(process.argv[2]) + "/build/" + path.basename(process.argv[2])), sfdStr)
